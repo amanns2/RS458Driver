@@ -1,14 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Copyright (C) Maxime Coquelin 2015
- * Copyright (C) STMicroelectronics SA 2017
- * Authors:  Maxime Coquelin <mcoquelin.stm32@gmail.com>
- *	     Gerald Baeza <gerald.baeza@st.com>
- *	     Erwan Le Ray <erwan.leray@st.com>
- *
- * Inspired by st-asc.c from STMicroelectronics (c)
- */
-
 #include <linux/clk.h>
 #include <linux/console.h>
 #include <linux/delay.h>
@@ -33,9 +22,12 @@
 #include <linux/tty.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/gpio.h>
+#include <linux/fs.h>
 
 #include "stm32-usart.h"
 
+static struct file *uart_dev;
 static struct net_device *my_net;
 static void stm32_usart_stop_tx(struct uart_port *port);
 static void stm32_usart_transmit_chars(struct uart_port *port);
@@ -102,6 +94,8 @@ static int stm32_usart_config_rs485(struct uart_port *port,
 	u32 usartdiv, baud, cr1, cr3;
 	bool over8;
 
+    pr_info("stm32_usart_config_rs485");
+    
 	stm32_usart_clr_bits(port, ofs->cr1, BIT(cfg->uart_enable_bit));
 
 	port->rs485 = *rs485conf;
@@ -109,6 +103,7 @@ static int stm32_usart_config_rs485(struct uart_port *port,
 	rs485conf->flags |= SER_RS485_RX_DURING_TX;
 
 	if (rs485conf->flags & SER_RS485_ENABLED) {
+        pr_info("SER_RS485_ENABLED");
 		cr1 = readl_relaxed(port->membase + ofs->cr1);
 		cr3 = readl_relaxed(port->membase + ofs->cr3);
 		usartdiv = readl_relaxed(port->membase + ofs->brr);
@@ -119,7 +114,8 @@ static int stm32_usart_config_rs485(struct uart_port *port,
 			usartdiv = usartdiv | (usartdiv & GENMASK(4, 0))
 				   << USART_BRR_04_R_SHIFT;
 
-		baud = DIV_ROUND_CLOSEST(port->uartclk, usartdiv);
+		//baud = DIV_ROUND_CLOSEST(port->uartclk, usartdiv);
+        baud = 3000000u;
 		stm32_usart_config_reg_rs485(&cr1, &cr3,
 					     rs485conf->delay_rts_before_send,
 					     rs485conf->delay_rts_after_send,
@@ -136,6 +132,7 @@ static int stm32_usart_config_rs485(struct uart_port *port,
 		writel_relaxed(cr3, port->membase + ofs->cr3);
 		writel_relaxed(cr1, port->membase + ofs->cr1);
 	} else {
+        pr_info("SER_RS485_DISABLED");
 		stm32_usart_clr_bits(port, ofs->cr3,
 				     USART_CR3_DEM | USART_CR3_DEP);
 		stm32_usart_clr_bits(port, ofs->cr1,
@@ -151,11 +148,10 @@ static int stm32_usart_init_rs485(struct uart_port *port,
 				  struct platform_device *pdev)
 {
 	struct serial_rs485 *rs485conf = &port->rs485;
-
 	rs485conf->flags = 0;
 	rs485conf->delay_rts_before_send = 0;
 	rs485conf->delay_rts_after_send = 0;
-
+    
 	if (!pdev->dev.of_node)
 		return -ENODEV;
 
@@ -279,26 +275,32 @@ static void stm32_usart_receive_chars_pio(struct uart_port *port)
 	}
 }
 
+static inline int netif_rx_ti(struct sk_buff *skb)
+{
+	if (in_interrupt())
+		return netif_rx(skb);
+	return netif_rx_ni(skb);
+}
+
 static void stm32_usart_push_buffer_dma(struct uart_port *port,
 					unsigned int dma_size)
 {
 	struct stm32_port *stm32_port = netdev_priv(my_net);
-	//struct tty_port *ttyport = &stm32_port->port.state->port;
-    struct sk_buff *skb; //for sending wenn full
+    struct sk_buff *skb = stm32_port -> skb;
 	unsigned char *dma_start;
-	//int dma_count;
 
 	dma_start = stm32_port->rx_buf + (RX_BUF_L - stm32_port->last_res);
     //---------------------------------------------------------------------------------
-    //todo copy to skb
-    print_hex_dump(KERN_DEBUG, "data: ", DUMP_PREFIX_OFFSET, 16, 1, dma_start, 16, true);
+    //print_hex_dump(KERN_DEBUG, "data: ", DUMP_PREFIX_OFFSET, 16, 1, dma_start, 16, true);
     
-    skb = dev_alloc_skb(dma_size + 2);
-    if (!skb) {
+    //skb = __dev_alloc_skb(dma_size,  GFP_ATOMIC);
+    //skb = dev_alloc_skb(dma_size);
+    skb = netdev_alloc_skb_ip_align(my_net, dma_size);
+    if (unlikely(skb == NULL)) {
         if (printk_ratelimit(  ))
-            printk(KERN_NOTICE "snull rx: low on mem - packet dropped\n");
+            printk(KERN_NOTICE "eth1 rx: low on mem - packet dropped\n");
         my_net->stats.rx_dropped++;
-        //goto error;
+        goto error;
     }
     
     memcpy(skb_put(skb, dma_size), dma_start, dma_size);
@@ -307,17 +309,18 @@ static void stm32_usart_push_buffer_dma(struct uart_port *port,
     skb->dev = my_net;
     skb->protocol = eth_type_trans(skb, my_net);
     skb->ip_summed = CHECKSUM_NONE; // let the OS check the checksum
-    my_net->stats.rx_packets++;
-    my_net->stats.rx_bytes += dma_size;
+    
     netif_rx(skb);
+    //netif_receive_skb(skb);
+    //netif_rx_ti(skb);
     
     //---------------------------------------------------------------------------------
-    
-	//dma_count = tty_insert_flip_string(ttyport, dma_start, dma_size);
+    my_net->stats.rx_bytes += dma_size;
 	port->icount.rx += dma_size;
+error:
 	stm32_port->last_res -= dma_size;
 	if (stm32_port->last_res == 0)
-		stm32_port->last_res = RX_BUF_L; //dma_count
+		stm32_port->last_res = dma_size; //dma_count RX_BUF_L
 }
 
 static void stm32_usart_receive_chars_dma(struct uart_port *port)
@@ -590,8 +593,6 @@ static irqreturn_t stm32_usart_interrupt(int irq, void *ptr)
 	struct stm32_port *stm32_port = netdev_priv(my_net);
 	struct stm32_usart_offsets *ofs = &stm32_port->info->ofs;
 	u32 sr;
-
-    pr_info("stm32_usart_interrupt");
     
 	sr = readl_relaxed(port->membase + ofs->isr);
 
@@ -634,7 +635,6 @@ static irqreturn_t stm32_usart_threaded_interrupt(int irq, void *ptr)
 	struct uart_port *port = ptr;
 
 	/* Receiver timeout irq for DMA RX */
-    pr_info("stm32_usart_threaded_interrupt");
 	stm32_usart_receive_chars(port, true);
 
 	return IRQ_HANDLED;
@@ -818,7 +818,6 @@ static int stm32_usart_start_rx_dma_cyclic(struct uart_port *port)
 }
 
 static int stm32_usart_startup(struct uart_port *port)
-//static int stm32_net_usart_startup(void)
 {
 	struct stm32_port *stm32_port = netdev_priv(my_net);
     struct uart_port *uPort = &stm32_port->port;
@@ -835,6 +834,8 @@ static int stm32_usart_startup(struct uart_port *port)
 				   IRQF_NO_SUSPEND, name, uPort);
 	if (ret)
 		return ret;
+    
+    uPort->flags |= SER_RS485_ENABLED;
 
 	/* RX FIFO Flush */
 	if (ofs->rqr != UNDEF_REG)
@@ -855,7 +856,6 @@ static int stm32_usart_startup(struct uart_port *port)
 }
 
 static void stm32_usart_shutdown(struct uart_port *port)
-//static void stm32_net_usart_shutdown(void)
 {
 	struct stm32_port *stm32_port = netdev_priv(my_net);
     struct uart_port *uPort = &stm32_port->port;
@@ -921,9 +921,7 @@ static unsigned int stm32_usart_get_databits(struct ktermios *termios)
 	return bits;
 }
 
-static void stm32_usart_set_termios(struct uart_port *port,
-				    struct ktermios *termios,
-				    struct ktermios *old)
+static void stm32_usart_set_termios(struct uart_port *port, struct ktermios *termios, struct ktermios *old)
 {
 	struct stm32_port *stm32_port = netdev_priv(my_net);
     struct uart_port *uPort = &stm32_port->port;
@@ -936,14 +934,11 @@ static void stm32_usart_set_termios(struct uart_port *port,
 	u32 cr1, cr2, cr3, isr;
 	unsigned long flags;
 	int ret;
-    
-    pr_info("stm32_usart_set_termios");
 
 	if (!stm32_port->hw_flow_control)
 		cflag &= ~CRTSCTS;
     
-	//baud = uart_get_baud_rate(uPort, termios, old, 0, uPort->uartclk / 8);
-    baud = 9600;
+    baud = 3000000u;
 
 	spin_lock_irqsave(&uPort->lock, flags);
 
@@ -1038,21 +1033,9 @@ static void stm32_usart_set_termios(struct uart_port *port,
 
 	usartdiv = DIV_ROUND_CLOSEST(uPort->uartclk, baud);
 
-	/*
-	 * The USART supports 16 or 8 times oversampling.
-	 * By default we prefer 16 times oversampling, so that the receiver
-	 * has a better tolerance to clock deviations.
-	 * 8 times oversampling is only used to achieve higher speeds.
-	 */
-	if (usartdiv < 16) {
-		oversampling = 8;
-		cr1 |= USART_CR1_OVER8;
-		stm32_usart_set_bits(uPort, ofs->cr1, USART_CR1_OVER8);
-	} else {
-		oversampling = 16;
-		cr1 &= ~USART_CR1_OVER8;
-		stm32_usart_clr_bits(uPort, ofs->cr1, USART_CR1_OVER8);
-	}
+    oversampling = 16;
+    cr1 &= ~USART_CR1_OVER8;
+    stm32_usart_clr_bits(uPort, ofs->cr1, USART_CR1_OVER8);
 
 	mantissa = (usartdiv / oversampling) << USART_BRR_DIV_M_SHIFT;
 	fraction = usartdiv % oversampling;
@@ -1219,7 +1202,7 @@ static int stm32_usart_init_port(struct stm32_port *stm32port,
 		return ret ? : -ENODEV;
 
 	port->iotype	= UPIO_MEM;
-	port->flags	= UPF_BOOT_AUTOCONF;
+	port->flags	= UPF_BOOT_AUTOCONF; // UPF_HARD_FLOW UPF_BOOT_AUTOCONF;
 	port->ops	= &stm32_uart_ops;
 	port->dev	= &pdev->dev;
 	port->fifosize	= stm32port->info->cfg.fifosize;
@@ -1349,18 +1332,14 @@ static int stm32_usart_of_dma_tx_probe(struct stm32_port *stm32port,
 
 static int my_net_send(struct sk_buff *skb, struct net_device *ndev)
 {
-
 	struct stm32_port *lp = netdev_priv(ndev);
     struct uart_port *port = &lp->port;
     struct sk_buff *sk_buff;
     struct dma_async_tx_descriptor *desc = NULL;
     struct stm32_usart_offsets *ofs = &lp->info->ofs;
-    //unsigned long flags;
     unsigned pktlen = skb->len;
     dma_cookie_t cookie;
     int ret = 0;
-    
-    pr_info("my_net_send");
     
 	//print_hex_dump(KERN_DEBUG, "data: ", DUMP_PREFIX_OFFSET, 16, 1, skb->data, 16, true);
     
@@ -1375,76 +1354,58 @@ static int my_net_send(struct sk_buff *skb, struct net_device *ndev)
 		writel_relaxed(USART_ICR_TCCF, port->membase + ofs->icr);
     }
     
-    if (lp->tx_ch){
-		memcpy(&lp->tx_buf[0], sk_buff->data, pktlen);
-        desc = dmaengine_prep_slave_single(lp->tx_ch,
-					   lp->tx_dma_buf,
-					   pktlen,
-					   DMA_MEM_TO_DEV,
-					   DMA_PREP_INTERRUPT);
+    if (!lp->tx_ch)
+		goto fallback_err;
+    
+    memcpy(&lp->tx_buf[0], sk_buff->data, pktlen);
+    desc = dmaengine_prep_slave_single(lp->tx_ch,
+                    lp->tx_dma_buf,
+                    pktlen,
+                    DMA_MEM_TO_DEV,
+                    DMA_PREP_INTERRUPT);
 
-        if (!desc){
-            goto fallback_err;            
-        }
-        
-        cookie = dmaengine_submit(desc);
-        ret = dma_submit_error(cookie);
-        if (ret) {
-            /* dma no yet started, safe to free resources */
-            dmaengine_terminate_async(lp->tx_ch);
-            goto fallback_err;
-        }
-
-        /* Issue pending DMA TX requests */
-        dma_async_issue_pending(lp->tx_ch);
-
-        stm32_usart_set_bits(port, ofs->cr3, USART_CR3_DMAT);
-    }else{
-		//stm32_usart_transmit_chars_pio(port);
+    if (!desc){
+        goto fallback_err;            
     }
+    
+    cookie = dmaengine_submit(desc);
+    ret = dma_submit_error(cookie);
+    if (ret) {
+        /* dma no yet started, safe to free resources */
+        dmaengine_terminate_async(lp->tx_ch);
+        goto fallback_err;
+    }
+
+    /* Issue pending DMA TX requests */
+    dma_async_issue_pending(lp->tx_ch);
+
+    stm32_usart_set_bits(port, ofs->cr3, USART_CR3_DMAT);
+    
+    ndev->stats.tx_packets++;
+    ndev->stats.tx_bytes += pktlen;
     
 	/* rely on TXE irq (mask or unmask) for sending remaining data */
     stm32_usart_tx_interrupt_disable(port);
     
 	//spin_unlock_irqrestore(&port->lock, flags);
-	
-    ndev->stats.tx_packets++;
-    ndev->stats.tx_bytes += pktlen;
   
 fallback_err:
-    skb_tx_timestamp(skb);
-    dev_kfree_skb (skb);
+    //skb_tx_timestamp(skb);
+    //dev_kfree_skb (skb);
+    __kfree_skb(skb);
     netif_start_queue(ndev);
     return NETDEV_TX_OK;
 }
 
 static int my_net_open(struct net_device *dev)
 {
-    //struct stm32_port *priv = netdev_priv(dev);
-    //int ret = 0;
-    //struct stm32_port *lp = netdev_priv(dev);
-    //struct uart_port *port = &lp->port;
-    //struct stm32_usart_offsets *ofs = &lp->info->ofs;
-    
-    //stm32_net_usart_startup();
-    //stm32_usart_set_bits(port, ofs->cr3, USART_CR3_RTSE);
-    
     netif_start_queue(dev);
     
     return 0;
 }
 
 static int my_net_close(struct net_device *dev)
-{
-    //struct stm32_port *priv = netdev_priv(dev);
-    //int ret = 0;
-    //struct stm32_port *lp = netdev_priv(dev);
-    //struct uart_port *port = &lp->port;
-    //struct stm32_usart_offsets *ofs = &lp->info->ofs;
-    
-    //stm32_net_usart_shutdown();
-    //stm32_usart_clr_bits(port, ofs->cr3, USART_CR3_RTSE);
-    
+{    
     netif_stop_queue(dev);
     
     return 0;
@@ -1461,6 +1422,7 @@ static int stm32_usart_serial_probe(struct platform_device *pdev)
 	const struct of_device_id *match;
 	struct stm32_port *stm32port;
     struct device_node *np = pdev->dev.of_node;
+    struct serial_rs485 *rs485conf;
 	int id, ret;
     
     my_net = alloc_etherdev(sizeof(struct stm32_port));
@@ -1562,9 +1524,12 @@ static int stm32_usart_serial_probe(struct platform_device *pdev)
 
 	pm_runtime_put_sync(&pdev->dev);
     
-    //registrate usart to send
-    //stm32_net_usart_startup();
-    //stm32_usart_net_set_termios(&stm32_usart_driver->tty_driver->init_termios);
+    rs485conf = &stm32port->port.rs485;
+    rs485conf->flags |= SER_RS485_ENABLED;
+    rs485conf->flags &= ~(SER_RS485_RTS_ON_SEND); //disable RTS pin on send
+    rs485conf->flags |= SER_RS485_RTS_AFTER_SEND; //enable RTS pin on send
+    
+    stm32_usart_config_rs485(&stm32port->port, rs485conf);
     
     return register_netdev(my_net);
 
@@ -1607,7 +1572,7 @@ static int stm32_usart_serial_remove(struct platform_device *pdev)
 	u32 cr3;
 
     //Remove USART
-    //stm32_net_usart_shutdown();
+    //stm32_usart_shutdown(&stm32_port->port);
     
     //Remove Serial
 	pm_runtime_get_sync(&pdev->dev);
@@ -1680,11 +1645,21 @@ static int __init stm32_usart_init(void)
 	if (ret)
 		uart_unregister_driver(&stm32_usart_driver);
 
+    //TODO: ugly remove
+    uart_dev = filp_open("/dev/ttyNET3", O_RDWR|O_LARGEFILE, 0);
+	if (IS_ERR(uart_dev)) {
+			printk("Failed : UART Open\n");
+	}
+	else{
+			printk("Succeed : UART Open\n");
+	}
+    
 	return ret;
 }
 
 static void __exit stm32_usart_exit(void)
 {
+    filp_close(uart_dev, NULL);
 	platform_driver_unregister(&stm32_serial_driver);
 	uart_unregister_driver(&stm32_usart_driver);
 }
