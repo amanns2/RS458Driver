@@ -21,24 +21,6 @@
 
 #include "usartNet.h"
 
-#define STMUART_DRV_VERSION "0.1.0"
-#define STMUART_DRV_NAME "stmNetUart"
-#define STMUART_TX_TIMEOUT (1 * HZ)
-
-struct stmuart {
-	struct net_device *net_dev;
-	spinlock_t lock;			/* transmit lock */
-	struct work_struct tx_work;		/* Flushes transmit buffer   */
-
-	struct serdev_device *serdev;
-	struct stmfrm_handle frm_handle;
-	struct sk_buff *rx_skb;
-
-	unsigned char *tx_head;			/* pointer to next XMIT byte */
-	int tx_left;				/* bytes left in XMIT queue  */
-	unsigned char *tx_buffer;
-};
-
 u16
 stmfrm_create_header(u8 *buf, u16 length)
 {
@@ -213,8 +195,6 @@ static void stmuart_transmit(struct work_struct *work)
 		spin_unlock_bh(&stm->lock);
 		return;
 	}
-	
-	//stm_flow_control(stm->serdev, false);
 
 	if (stm->tx_left <= 0)  {
 		/* Now serial buffer is almost free & we can start
@@ -225,15 +205,18 @@ static void stmuart_transmit(struct work_struct *work)
 		netif_wake_queue(stm->net_dev);
 		return;
 	}
-
+    
+    //serdev_device_set_tiocm(stm->serdev, TIOCM_RTS, 0);
+    
 	written = serdev_device_write_buf(stm->serdev, stm->tx_head,
 					  stm->tx_left);
+    
+    //serdev_device_set_tiocm(stm->serdev, 0, TIOCM_RTS);
+     
 	if (written > 0) {
 		stm->tx_left -= written;
 		stm->tx_head += written;
 	}
-	
-	//stm_flow_control(stm->serdev, true);
 	
 	spin_unlock_bh(&stm->lock);
 }
@@ -256,7 +239,6 @@ static const struct serdev_device_ops stm_serdev_ops = {
 static int stmuart_netdev_open(struct net_device *dev)
 {
 	struct stmuart *stm = netdev_priv(dev);
-
 	netif_start_queue(stm->net_dev);
  
 	return 0;
@@ -285,6 +267,8 @@ stmuart_netdev_xmit(struct sk_buff *skb, struct net_device *dev)
 	u8 *pos;
     
 	spin_lock(&stm->lock);
+    gpiod_set_value(stm->rts_gpio, 1);
+    //serdev_device_wait_for_cts(stm->serdev, true, 10);
 
 	WARN_ON(stm->tx_left);
 
@@ -312,18 +296,26 @@ stmuart_netdev_xmit(struct sk_buff *skb, struct net_device *dev)
 	pos += stmfrm_create_footer(pos);
 
 	netif_stop_queue(stm->net_dev);
+    
+    //serdev_device_set_tiocm(stm->serdev, TIOCM_RTS, 0);
 
 	written = serdev_device_write_buf(stm->serdev, stm->tx_buffer,
 					  pos - stm->tx_buffer);
+    
+    //serdev_device_set_tiocm(stm->serdev, 0, TIOCM_RTS);
+    
 	if (written > 0) {
 		stm->tx_left = (pos - stm->tx_buffer) - written;
 		stm->tx_head = stm->tx_buffer + written;
 		n_stats->tx_bytes += written;
 	}
-	spin_unlock(&stm->lock);
+	
 
-	netif_trans_update(dev);
 out:
+    spin_unlock(&stm->lock);
+    gpiod_set_value(stm->rts_gpio, 0);
+    //serdev_device_wait_for_cts(stm->serdev, false, 10);
+    netif_trans_update(dev);
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -384,7 +376,7 @@ static void stmuart_netdev_setup(struct net_device *dev)
 	dev->netdev_ops = &stmuart_netdev_ops;
 	dev->watchdog_timeo = STMUART_TX_TIMEOUT;
 	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
-	//dev->tx_queue_len = 100;
+	dev->tx_queue_len = 100;
 
 	/* MTU range: 46 - 1500 */
 	dev->min_mtu = STMFRM_MIN_MTU;
@@ -404,8 +396,8 @@ static int stm_uart_probe(struct serdev_device *serdev)
 	struct net_device *stmuart_dev = alloc_etherdev(sizeof(struct stmuart));
 	struct stmuart *stm;
 	const char *mac;
-	u32 speed = 10000000u;
-    //u32 speed = 1000000u;
+	//u32 speed = 10000000u;
+    u32 speed = 3000000u;
 	int ret;
     
 	if (!stmuart_dev)
@@ -419,7 +411,7 @@ static int stm_uart_probe(struct serdev_device *serdev)
 		pr_err("qca_uart: Fail to retrieve private structure\n");
 		ret = -ENOMEM;
 		goto free;
-	}
+	} 
 	stm->net_dev = stmuart_dev;
 	stm->serdev = serdev;
 	qcafrm_fsm_init_uart(&stm->frm_handle);
@@ -454,7 +446,13 @@ static int stm_uart_probe(struct serdev_device *serdev)
    
 	serdev_device_set_flow_control(serdev, false);
     
-    //serdev_device_set_cts(serdev, false);
+    stm->rts_gpio = devm_gpiod_get(&serdev->dev, "rts", GPIOD_OUT_HIGH);
+    gpiod_set_value(stm->rts_gpio, 0);
+    
+    if(IS_ERR(stm->rts_gpio)){
+        dev_err(&serdev->dev, "Unable to open rts_gpio %s\n",
+			stmuart_dev->name);
+    }
 
 	ret = register_netdev(stmuart_dev);
 	if (ret) {
@@ -464,10 +462,6 @@ static int stm_uart_probe(struct serdev_device *serdev)
 		cancel_work_sync(&stm->tx_work);
 		goto free;
 	}
-	
-	//serdev_device_set_tiocm(serdev, TIOCM_RTS, 0);
-	//ret = serdev_device_set_tiocm(serdev, 0, TIOCM_RTS);
-    //ret = serdev_device_get_tiocm(serdev);
     
 	return ret;
 

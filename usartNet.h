@@ -2,6 +2,11 @@
 #include <linux/if_vlan.h>
 #include <linux/types.h>
 #include <linux/serdev.h>
+#include <linux/gpio/consumer.h>
+
+#define STMUART_DRV_VERSION "0.1.0"
+#define STMUART_DRV_NAME "stmNetUart"
+#define STMUART_TX_TIMEOUT (1 * HZ)
 
 /* Frame is currently being received */
 #define STMFRM_GATHER 0
@@ -30,7 +35,7 @@
 #define STMFRM_HEADER_LEN 8
 
 /* QCA7K footer len */
-#define STMFRM_FOOTER_LEN 1
+#define STMFRM_FOOTER_LEN 2
 
 /* QCA7K Framing. */
 #define STMFRM_ERR_BASE -1000
@@ -42,7 +47,7 @@ enum stmfrm_state {
 	/*  Waiting second 0xAA of header */
 	STMFRM_WAIT_AA2 = STMFRM_WAIT_AA1 - 1,
 
-	/*  Waiting third 0xAA of header */
+	/*  Waiting third 0xAA of header */ 
 	STMFRM_WAIT_AA3 = STMFRM_WAIT_AA2 - 1,
 
 	/*  Waiting fourth 0xAA of header */
@@ -60,7 +65,7 @@ enum stmfrm_state {
 	 *  the end of the Ethernet frame
 	 *  Waiting for first 0x55 of footer
 	 */
-	STMFRM_WAIT_551 = 1
+	STMFRM_WAIT_551 = 1,
 };
 
 /*   Structure to maintain the frame decoding during reception. */
@@ -88,15 +93,6 @@ static inline void qcafrm_fsm_init_uart(struct stmfrm_handle *handle)
 	handle->state = handle->init;
 }
 
-static inline int serdev_device_set_cts(struct serdev_device *serdev, bool enable)
-{
-	if (enable)
-		return serdev_device_set_tiocm(serdev, TIOCM_CTS, 0);
-	else
-		return serdev_device_set_tiocm(serdev, 0, TIOCM_CTS);
-}
-
-
 
 /*   Gather received bytes and try to extract a full Ethernet frame
  *   by following a simple state machine.
@@ -110,3 +106,18 @@ static inline int serdev_device_set_cts(struct serdev_device *serdev, bool enabl
  */
 
 s32 stmfrm_fsm_decode(struct stmfrm_handle *handle, u8 *buf, u16 buf_len, u8 recv_byte);
+
+struct stmuart {
+	struct net_device *net_dev;
+    struct gpio_desc *rts_gpio;
+	spinlock_t lock;			/* transmit lock */
+	struct work_struct tx_work;		/* Flushes transmit buffer   */
+
+	struct serdev_device *serdev;
+	struct stmfrm_handle frm_handle;
+	struct sk_buff *rx_skb;
+
+	unsigned char *tx_head;			/* pointer to next XMIT byte */
+	int tx_left;				/* bytes left in XMIT queue  */
+	unsigned char *tx_buffer;
+};
