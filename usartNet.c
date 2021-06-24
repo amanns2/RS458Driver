@@ -495,7 +495,6 @@ static struct serdev_device_driver stm_uart_driver = {
 module_serdev_device_driver(stm_uart_driver);
 
 MODULE_DESCRIPTION("Ba USART Network driver");
-MODULE_AUTHOR("Qualcomm Atheros Communications");
 MODULE_AUTHOR("Sebastian Amann <sebastian.amann@ost.ch>");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(STMUART_DRV_VERSION);
