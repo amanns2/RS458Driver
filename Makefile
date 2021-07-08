@@ -11,5 +11,5 @@ clean:
 .PHONY: modules clean
 
 else
-    obj-m := usartNet.o
+    obj-m := serdevNetwork.o
 endif
