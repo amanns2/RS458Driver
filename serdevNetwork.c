@@ -325,7 +325,6 @@ static int stm_uart_probe(struct serdev_device *serdev)
 	struct stmuart *stm;
 	const char *mac;
 	u32 speed = 10000000u;
-    //u32 speed = 3000000u;
 	int ret;
     
 	if (!stmuart_dev)
@@ -351,11 +350,11 @@ static int stm_uart_probe(struct serdev_device *serdev)
 	if (!IS_ERR(mac))
 		ether_addr_copy(stm->net_dev->dev_addr, mac);
 
-	//if (!is_valid_ether_addr(stm->net_dev->dev_addr)) {
+	if (!is_valid_ether_addr(stm->net_dev->dev_addr)) {
 		eth_hw_addr_random(stm->net_dev);
 		dev_info(&serdev->dev, "Using random MAC address: %pM\n",
 			 stm->net_dev->dev_addr);
-	//}
+	}
 
 	netif_carrier_on(stm->net_dev);
 	serdev_device_set_drvdata(serdev, stm);
