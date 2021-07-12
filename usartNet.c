@@ -22,42 +22,28 @@
 #include "usartNet.h"
 
 u16
-stmfrm_create_header(u8 *buf, u16 length)
+stmfrm_create_header(u8 *buf)
 {
-	__le16 len;
 
 	if (!buf)
 		return 0;
-
-	len = cpu_to_le16(length);
 
 	buf[0] = 0xAA;
 	buf[1] = 0xAA;
 	buf[2] = 0xAA;
 	buf[3] = 0xAA;
-	buf[4] = len & 0xff;
-	buf[5] = (len >> 8) & 0xff;
-	buf[6] = 0;
-	buf[7] = 0;
+	buf[4] = 0xAA;
+	buf[5] = 0xAA;
+	buf[6] = 0xAA;
+	buf[7] = 0xAB;
 
 	return STMFRM_HEADER_LEN;
 }
 
-u16
-stmfrm_create_footer(u8 *buf)
-{
-	if (!buf)
-		return 0;
-
-	buf[0] = 0x55;
-	return STMFRM_FOOTER_LEN;
-}
-
 s32
-stmfrm_fsm_decode(struct stmfrm_handle *handle, u8 *buf, u16 buf_len, u8 recv_byte)
+stmfrm_fsm_decode(struct stmfrm_handle *handle, u8 *buf, u8 recv_byte)
 {
 	s32 ret = STMFRM_GATHER;
-	u16 len;
 
 	switch (handle->state) {
 	/* 4 bytes header pattern */
@@ -65,6 +51,9 @@ stmfrm_fsm_decode(struct stmfrm_handle *handle, u8 *buf, u16 buf_len, u8 recv_by
 	case STMFRM_WAIT_AA2:
 	case STMFRM_WAIT_AA3:
 	case STMFRM_WAIT_AA4:
+	case STMFRM_WAIT_AA5:
+	case STMFRM_WAIT_AA6:
+	case STMFRM_WAIT_AA7:
 		if (recv_byte != 0xAA) {
 			ret = STMFRM_NOHEAD;
 			handle->state = handle->init;
@@ -72,45 +61,19 @@ stmfrm_fsm_decode(struct stmfrm_handle *handle, u8 *buf, u16 buf_len, u8 recv_by
 			handle->state--;
 		}
 		break;
-		/* 2 bytes length. */
-		/* Borrow offset field to hold length for now. */
-	case STMFRM_WAIT_LEN_BYTE0:
-		handle->offset = recv_byte;
-		handle->state = STMFRM_WAIT_LEN_BYTE1;
-		break;
-	case STMFRM_WAIT_LEN_BYTE1:
-		handle->offset = handle->offset | (recv_byte << 8);
-		handle->state = STMFRM_WAIT_RSVD_BYTE1;
-		break;
-	case STMFRM_WAIT_RSVD_BYTE1:
-		handle->state = STMFRM_WAIT_RSVD_BYTE2;
-		break;
-	case STMFRM_WAIT_RSVD_BYTE2:
-		len = handle->offset;
-		if (len > buf_len || len < STMFRM_MIN_LEN) {
-			ret = STMFRM_INVLEN;
+	case STMFRM_WAIT_AB8:
+		if (recv_byte != 0xAB) {
+			ret = STMFRM_NOHEAD;
 			handle->state = handle->init;
 		} else {
-			handle->state = (enum stmfrm_state)(len + 1);
-			/* Remaining number of bytes. */
-			handle->offset = 0;
+			handle->state--;
+            handle->offset = 0;
 		}
 		break;
 	default:
 		/* Receiving Ethernet frame itself. */
 		buf[handle->offset] = recv_byte;
 		handle->offset++;
-		handle->state--;
-		break;
-	case STMFRM_WAIT_551:
-		if (recv_byte != 0x55) {
-			ret = STMFRM_NOTAIL;
-			handle->state = handle->init;
-		} else {
-			ret = handle->offset;
-			/* Frame is fully received. */
-			handle->state = handle->init;
-		}
 		break;
 	}
 
@@ -124,6 +87,7 @@ stm_tty_receive(struct serdev_device *serdev, const unsigned char *data,
 	struct stmuart *stm = serdev_device_get_drvdata(serdev);
 	struct net_device *netdev = stm->net_dev;
 	struct net_device_stats *n_stats = &netdev->stats;
+    struct stmfrm_handle *frame_state = &stm->frm_handle;
 	size_t i;
 
 	if (!stm->rx_skb) {
@@ -142,40 +106,33 @@ stm_tty_receive(struct serdev_device *serdev, const unsigned char *data,
 
 		retcode = stmfrm_fsm_decode(&stm->frm_handle,
 					    stm->rx_skb->data,
-					    skb_tailroom(stm->rx_skb),
 					    data[i]);
 
 		switch (retcode) {
 		case STMFRM_GATHER:
+			break;
 		case STMFRM_NOHEAD:
-			break;
-		case STMFRM_NOTAIL:
-			netdev_dbg(netdev, "recv: no RX tail\n");
-			n_stats->rx_errors++;
-			n_stats->rx_dropped++;
-			break;
-		case STMFRM_INVLEN:
-			netdev_dbg(netdev, "recv: invalid RX length\n");
-			n_stats->rx_errors++;
-			n_stats->rx_dropped++;
-			break;
-		default:
-			n_stats->rx_packets++;
-			n_stats->rx_bytes += retcode;
-			skb_put(stm->rx_skb, retcode);
-			stm->rx_skb->protocol = eth_type_trans(
-						stm->rx_skb, stm->rx_skb->dev);
-			stm->rx_skb->ip_summed = CHECKSUM_NONE;
-			netif_rx_ni(stm->rx_skb);
-			stm->rx_skb = netdev_alloc_skb_ip_align(netdev,
-								netdev->mtu +
-								VLAN_ETH_HLEN);
-			if (!stm->rx_skb) {
-				netdev_dbg(netdev, "recv: out of RX resources\n");
-				n_stats->rx_errors++;
-				return i;
-			}
-		}
+			frame_state->state = STMFRM_WAIT_AA1;
+			return 0;
+        }
+	}
+
+	frame_state->state = STMFRM_WAIT_AA1;
+
+	n_stats->rx_packets++;
+	n_stats->rx_bytes += frame_state->offset;
+	skb_put(stm->rx_skb, frame_state->offset);
+	stm->rx_skb->protocol = eth_type_trans(
+				stm->rx_skb, stm->rx_skb->dev);
+	stm->rx_skb->ip_summed = CHECKSUM_NONE;
+	netif_rx_ni(stm->rx_skb);
+	stm->rx_skb = netdev_alloc_skb_ip_align(netdev,
+						netdev->mtu +
+						VLAN_ETH_HLEN);
+	if (!stm->rx_skb) {
+		netdev_dbg(netdev, "recv: out of RX resources\n");
+		n_stats->rx_errors++;
+		return i;
 	}
 
 	return i;
@@ -267,8 +224,6 @@ stmuart_netdev_xmit(struct sk_buff *skb, struct net_device *dev)
 	u8 *pos;
     
 	spin_lock(&stm->lock);
-    gpiod_set_value(stm->rts_gpio, 1);
-    //serdev_device_wait_for_cts(stm->serdev, true, 10);
 
 	WARN_ON(stm->tx_left);
 
@@ -278,12 +233,14 @@ stmuart_netdev_xmit(struct sk_buff *skb, struct net_device *dev)
 		goto out;
 	}
 
+	gpiod_set_value(stm->rts_gpio, 1);
+
 	pos = stm->tx_buffer;
 
 	if (skb->len < STMFRM_MIN_LEN)
 		pad_len = STMFRM_MIN_LEN - skb->len;
 
-	pos += stmfrm_create_header(pos, skb->len + pad_len);
+	pos += stmfrm_create_header(pos);
 
 	memcpy(pos, skb->data, skb->len);
 	pos += skb->len;
@@ -292,8 +249,6 @@ stmuart_netdev_xmit(struct sk_buff *skb, struct net_device *dev)
 		memset(pos, 0, pad_len);
 		pos += pad_len;
 	}
-
-	pos += stmfrm_create_footer(pos);
 
 	netif_stop_queue(stm->net_dev);
     
@@ -309,13 +264,12 @@ stmuart_netdev_xmit(struct sk_buff *skb, struct net_device *dev)
 		stm->tx_head = stm->tx_buffer + written;
 		n_stats->tx_bytes += written;
 	}
-	
+	spin_unlock(&stm->lock);
 
+	gpiod_set_value(stm->rts_gpio, 0);
+
+	netif_trans_update(dev);
 out:
-    spin_unlock(&stm->lock);
-    gpiod_set_value(stm->rts_gpio, 0);
-    //serdev_device_wait_for_cts(stm->serdev, false, 10);
-    netif_trans_update(dev);
 	dev_kfree_skb_any(skb);
 	return NETDEV_TX_OK;
 }
@@ -339,7 +293,7 @@ static int stmuart_netdev_init(struct net_device *dev)
 	dev->mtu = STMFRM_MAX_MTU;
 	dev->type = ARPHRD_ETHER;
 
-	len = STMFRM_HEADER_LEN + STMFRM_MAX_LEN + STMFRM_FOOTER_LEN;
+	len = STMFRM_HEADER_LEN + STMFRM_MAX_LEN;
 	stm->tx_buffer = devm_kmalloc(&stm->serdev->dev, len, GFP_KERNEL);
 	if (!stm->tx_buffer)
 		return -ENOMEM;
@@ -411,7 +365,7 @@ static int stm_uart_probe(struct serdev_device *serdev)
 		pr_err("qca_uart: Fail to retrieve private structure\n");
 		ret = -ENOMEM;
 		goto free;
-	} 
+	}
 	stm->net_dev = stmuart_dev;
 	stm->serdev = serdev;
 	qcafrm_fsm_init_uart(&stm->frm_handle);
@@ -445,15 +399,15 @@ static int stm_uart_probe(struct serdev_device *serdev)
 	dev_info(&serdev->dev, "Using baudrate: %u\n", speed);
    
 	serdev_device_set_flow_control(serdev, false);
-    
-    stm->rts_gpio = devm_gpiod_get(&serdev->dev, "rts", GPIOD_OUT_HIGH);
+
+	stm->rts_gpio = devm_gpiod_get(&serdev->dev, "rts", GPIOD_OUT_HIGH);
     gpiod_set_value(stm->rts_gpio, 0);
     
     if(IS_ERR(stm->rts_gpio)){
         dev_err(&serdev->dev, "Unable to open rts_gpio %s\n",
 			stmuart_dev->name);
     }
-
+	
 	ret = register_netdev(stmuart_dev);
 	if (ret) {
 		dev_err(&serdev->dev, "Unable to register net device %s\n",

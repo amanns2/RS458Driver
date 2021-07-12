@@ -117,7 +117,6 @@ stm_tty_receive(struct serdev_device *serdev, const unsigned char *data,
     if (!stm->rx_skb) {
         netdev_dbg(netdev, "recv: out of RX resources\n");
         n_stats->rx_errors++;
-        return i;
     }
 
 	return i;
@@ -325,8 +324,8 @@ static int stm_uart_probe(struct serdev_device *serdev)
 	struct net_device *stmuart_dev = alloc_etherdev(sizeof(struct stmuart));
 	struct stmuart *stm;
 	const char *mac;
-	//u32 speed = 10000000u;
-    u32 speed = 3000000u;
+	u32 speed = 10000000u;
+    //u32 speed = 3000000u;
 	int ret;
     
 	if (!stmuart_dev)
